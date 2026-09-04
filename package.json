@@ -1,14 +1,20 @@
 {
-  "name": "teams-chat-backup",
-  "version": "1.0.0",
-  "description": "Exports a Microsoft Teams chat",
-  "main": "index.js",
+  "name": "teams-chat-sync",
+  "version": "0.1.0",
+  "description": "Incremental Microsoft Teams chat backup via Microsoft Graph API",
+  "main": "src/index.js",
   "scripts": {
     "start": "node src",
     "lint": "eslint src"
   },
-  "keywords": [],
-  "author": "Edgar de Graaff",
+  "keywords": [
+    "microsoft-teams",
+    "graph-api",
+    "backup",
+    "export",
+    "incremental"
+  ],
+  "author": "Joan César García León",
   "license": "MIT",
   "dependencies": {
     "axios": "^0.21.1"
