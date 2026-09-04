@@ -12,11 +12,11 @@ const fsAPI = {
   readFile: util.promisify(fs.readFile)
 };
 
-const FILENAME_MATCH = /messages-([0-9]{1,})\.json/;
+const FILENAME_MATCH = /^(messages|delta)-.*\.json$/;
 const UPLOADED_IMAGE_MATCH = /https:\/\/graph.microsoft.com\/beta\/chats([^"]*)/g;
 
 class Backup {
-  constructor ({ chatId, authToken, target }) {
+  constructor({ chatId, authToken, target }) {
     this.target = target;
     this.chatId = chatId;
     this.instance = axios.create({
@@ -29,23 +29,20 @@ class Backup {
     });
   }
 
-  async run () {
+  async run() {
     await this.createTarget();
     await this.getMessages();
     await this.getImages();
     await this.createHtml();
   }
 
-  createTarget (location) {
-    return new Promise((resolve, reject) => {
-      function probe (location, callback) {
+  createTarget() {
+    return new Promise((resolve) => {
+      function probe(location, callback) {
         fs.access(location, err => {
           if (err) {
-            // then try its parent
             probe(path.dirname(location), err => {
               if (err) return callback(err);
-
-              // now create it
               fs.mkdir(location, callback);
             });
           } else {
@@ -53,197 +50,261 @@ class Backup {
           }
         });
       }
-
       probe(path.resolve(this.target), resolve);
     });
   }
 
-  async getMessages () {
-    // URL to first page (most recent messages)
+  readState() {
+    try {
+      return JSON.parse(fs.readFileSync(path.resolve(this.target, '_state.json'), 'utf8'));
+    } catch {
+      return null;
+    }
+  }
+
+  writeState(state) {
+    fs.writeFileSync(
+      path.resolve(this.target, '_state.json'),
+      JSON.stringify(state, null, 2),
+      'utf8'
+    );
+  }
+
+  loadKnownIds() {
+    const ids = new Set();
+    try {
+      const files = fs.readdirSync(this.target).filter(f => FILENAME_MATCH.test(f));
+      for (const f of files) {
+        const data = JSON.parse(fs.readFileSync(path.resolve(this.target, f), 'utf8'));
+        for (const m of data) ids.add(m.id);
+      }
+    } catch {}
+    return ids;
+  }
+
+  async getMessages() {
+    const state = this.readState();
+    const knownIds = this.loadKnownIds();
+    const isIncremental = knownIds.size > 0;
+
+    const filePrefix = isIncremental
+      ? `delta-${new Date().toISOString().replace(/[:.]/g, '-')}`
+      : 'messages';
+
+    console.log(`  ${isIncremental ? `Incremental sync (${knownIds.size} msgs known)` : 'Full backfill'}`);
+
     let url = `https://graph.microsoft.com/beta/me/chats/${this.chatId}/messages`;
     let page = 0;
+    let newestSeen = state ? state.lastSyncedAt : null;
+    let totalNew = 0;
+    let stopFlag = false;
 
-    while (true) {
-      const pageNum = `${page++}`.padStart(5, 0);
-
+    while (url && !stopFlag) {
+      const pageNum = `${page++}`.padStart(5, '0');
       try {
-        console.log(`Retrieving page ${pageNum}`);
+        console.log(`  Page ${pageNum}`);
         const res = await this.instance.get(url);
 
         if (res.data.value && res.data.value.length) {
-          await fsAPI.writeFile(
-            path.resolve(this.target, `messages-${pageNum}.json`),
-            JSON.stringify(res.data.value, null, '  '),
-            'utf8');
+          const newMsgs = [];
+          for (const m of res.data.value) {
+            if (isIncremental && knownIds.has(m.id)) {
+              // Reached known territory. But an edit changes lastModifiedDateTime
+              // while keeping the id — those we DO want. Keep any msg whose
+              // lastModifiedDateTime is newer than what we knew.
+              const t = m.lastModifiedDateTime || m.createdDateTime;
+              if (state && state.lastSyncedAt && t > state.lastSyncedAt) {
+                newMsgs.push(m);
+                if (!newestSeen || t > newestSeen) newestSeen = t;
+                continue;
+              }
+              // Truly old and unchanged — stop paginating.
+              stopFlag = true;
+              break;
+            }
+            newMsgs.push(m);
+            const t = m.lastModifiedDateTime || m.createdDateTime;
+            if (!newestSeen || t > newestSeen) newestSeen = t;
           }
 
-        // if there's a next page (earlier messages) ...
-        if (res.data['@odata.count'] === 20 && res.data['@odata.nextLink']) {
-          // .. get these in the next round
-          url = res.data['@odata.nextLink'];
-        } else {
-          // otherwise we're done
-          console.log(`Done with ${this.target}\n`);
-          break;
+          if (newMsgs.length) {
+            await fsAPI.writeFile(
+              path.resolve(this.target, `${filePrefix}-${pageNum}.json`),
+              JSON.stringify(newMsgs, null, '  '),
+              'utf8'
+            );
+            totalNew += newMsgs.length;
+          }
+        }
+
+        if (!stopFlag) {
+          url = res.data['@odata.nextLink'] || null;
         }
       } catch (err) {
-        if (err.response.status === 401) {
-          console.log('Hit 401, please refresh the token');
-          break;
-        } else if (err.response.status === 429) {
-          console.log('Hit 429, waiting ten seconds...');
-          await new Promise(res => setTimeout(res, 10000));
+        const status = err.response && err.response.status;
+        if (status === 401) {
+          console.log('  Hit 401, refresh the token');
+          throw err;
+        } else if (status === 429) {
+          const retry = parseInt((err.response.headers || {})['retry-after'], 10) || 10;
+          console.log(`  Hit 429, waiting ${retry}s`);
+          await new Promise(r => setTimeout(r, retry * 1000));
           page--;
         } else {
-          console.log('Died because of unhandled response', err);
+          console.log('  Unhandled error:', err.message);
           break;
         }
       }
     }
+
+    if (newestSeen) {
+      this.writeState({
+        lastSyncedAt: newestSeen,
+        updatedAt: new Date().toISOString()
+      });
+    }
+
+    console.log(`  ${totalNew} new msgs`);
   }
 
-  async getPages () {
+  async getPages() {
     const filenames = await fsAPI.readdir(this.target);
-    return filenames.filter(filename => FILENAME_MATCH.test(filename));
+    return filenames.filter(f => FILENAME_MATCH.test(f)).sort();
   }
 
-  async getImages () {
+  async getImages() {
     const pages = await this.getPages();
+    let index = {};
+    try {
+      const existing = await fsAPI.readFile(path.resolve(this.target, 'images.json'), 'utf8');
+      index = JSON.parse(existing);
+    } catch {}
 
-    const index = {};
-    let imageIdx = 0;
+    let imageIdx = Object.keys(index).length;
 
-    // loop over pages
     for (const page of pages) {
       const data = await fsAPI.readFile(path.resolve(this.target, page), 'utf8');
       const messages = JSON.parse(data);
 
-      // loop over messages
       for (const message of messages) {
-        if (message.body.contentType === 'html') {
-          // detect image
-          const imageUrls = message.body.content.match(UPLOADED_IMAGE_MATCH);
-          if (imageUrls) {
-            for (const imageUrl of imageUrls) {
-              if (!index[imageUrl]) {
-                const targetFilename = 'image-' + `0000${imageIdx++}`.slice(-5);
-                const imagePath = path.resolve(this.target, targetFilename);
-                
-                if (fs.existsSync(imagePath)) {
-                  console.log(`Image ${targetFilename} already exists`);
-                } else {
-                  console.log('Downloading', targetFilename);
-  
-                  try {
-                    const res = await this.instance({
-                      method: 'get',
-                      url: imageUrl,
-                      responseType: 'stream'
-                    });
-    
-                    res.data.pipe(fs.createWriteStream(imagePath));
-                    await pipeDone(res.data);
-                    await new Promise(res => setTimeout(res, 1000));
-                  } catch (err) {
-                    if (err.response.status === 403) {
-                      console.log('Hit 403, document not available anymore?');
-                    } else {
-                      console.log('Died because of unhandled response', err);
-                      break;
-                    }
-                  }
-                }
+        if (!message.body || message.body.contentType !== 'html') continue;
+        const imageUrls = message.body.content.match(UPLOADED_IMAGE_MATCH);
+        if (!imageUrls) continue;
 
-                index[imageUrl] = targetFilename;
-              }
+        for (const imageUrl of imageUrls) {
+          if (index[imageUrl]) continue;
+          const targetFilename = 'image-' + `0000${imageIdx++}`.slice(-5);
+          const imagePath = path.resolve(this.target, targetFilename);
+
+          if (fs.existsSync(imagePath)) {
+            index[imageUrl] = targetFilename;
+            continue;
+          }
+
+          console.log('  Image', targetFilename);
+          try {
+            const res = await this.instance({ method: 'get', url: imageUrl, responseType: 'stream' });
+            res.data.pipe(fs.createWriteStream(imagePath));
+            await pipeDone(res.data);
+            await new Promise(r => setTimeout(r, 500));
+            index[imageUrl] = targetFilename;
+          } catch (err) {
+            const status = err.response && err.response.status;
+            if (status === 403) {
+              console.log('  Image 403 (gone)');
+              index[imageUrl] = targetFilename;
+            } else if (status === 429) {
+              const retry = parseInt((err.response.headers || {})['retry-after'], 10) || 10;
+              console.log(`  Image 429, wait ${retry}s`);
+              await new Promise(r => setTimeout(r, retry * 1000));
+            } else {
+              console.log('  Image error:', err.message);
             }
           }
         }
       }
     }
 
-    // write image index
     await fsAPI.writeFile(path.resolve(this.target, 'images.json'), JSON.stringify(index), 'utf8');
   }
 
-  async createHtml () {
-    // need my id to identify 'my' messages
+  async createHtml() {
     const profile = await this.instance.get('https://graph.microsoft.com/v1.0/me/');
     const myId = profile.data.id;
 
-    // collect pages to include
     const pages = await this.getPages();
-
-    // get image mappings
-    let imageIndex;
+    let imageIndex = {};
     try {
-      const imageIndexData = await fsAPI.readFile(path.resolve(this.target, 'images.json'), 'utf8');
-      imageIndex = JSON.parse(imageIndexData);
-    } catch (er) {
-      console.error('couldn\'t read images index', er);
-      // continue without images
+      imageIndex = JSON.parse(await fsAPI.readFile(path.resolve(this.target, 'images.json'), 'utf8'));
+    } catch {}
+
+    // Collect all messages, dedupe by id, keep the most recently modified version.
+    const byId = new Map();
+    for (const page of pages) {
+      const data = await fsAPI.readFile(path.resolve(this.target, page), 'utf8');
+      const messages = JSON.parse(data);
+      for (const m of messages) {
+        const existing = byId.get(m.id);
+        const tNew = m.lastModifiedDateTime || m.createdDateTime;
+        const tOld = existing && (existing.lastModifiedDateTime || existing.createdDateTime);
+        if (!existing || tNew > tOld) byId.set(m.id, m);
+      }
     }
 
-    const fd = await fsAPI.open(path.resolve(this.target, 'index.html'), 'w');
+    // Sort chronologically (oldest first).
+    const all = Array.from(byId.values()).sort((a, b) => {
+      const ta = a.createdDateTime || '';
+      const tb = b.createdDateTime || '';
+      return ta < tb ? -1 : ta > tb ? 1 : 0;
+    });
 
-    // write head
+    const fd = await fsAPI.open(path.resolve(this.target, 'index.html'), 'w');
     await fsAPI.write(fd, `<html>
   <head>
     <link rel="stylesheet" href="../../messages.css">
+    <meta charset="utf-8">
   </head>
   <body>
 `);
 
-    // loop over pages in reverse order
-    for (let pageIdx = pages.length - 1; pageIdx >= 0; pageIdx--) {
-      const page = pages[pageIdx];
+    for (const message of all) {
+      if (!message.from) continue;
+      const timestamp = message.lastModifiedDateTime || message.createdDateTime;
 
-      const data = await fsAPI.readFile(path.resolve(this.target, page), 'utf8');
-      const messages = JSON.parse(data);
-
-      // loop over in reverse order:
-      for (let messageIdx = messages.length - 1; messageIdx >= 0; messageIdx--) {
-        const message = messages[messageIdx];
-
-        // message sent by a user
-        if (message.from) {
-          if (message.from.user != null) {
-            await fsAPI.write(fd, `<div class="message ${message.from.user.id === myId ? 'message-right' : 'message-left'}">
-  <div class="message-timestamp">${message.lastModifiedDateTime || message.createdDateTime}</div>
-  <div class="message-sender">${message.from.user.displayName}</div>
+      if (message.from.user != null) {
+        const side = message.from.user.id === myId ? 'message-right' : 'message-left';
+        await fsAPI.write(fd, `<div class="message ${side}">
+  <div class="message-timestamp">${timestamp}</div>
+  <div class="message-sender">${escapeHtml(message.from.user.displayName || '')}</div>
 `);
-
-            if (message.body.contentType === 'html') {
-              await fsAPI.write(fd, `<div class="message-body">${replaceImages(message.body.content, imageIndex)}</div>
-</div>`);
-            } else {
-              await fsAPI.write(fd, `<div class="message-body">${escapeHtml(message.body.content)}</div>
-</div>`);
-            }
-          // message sent by a bot
-          } else if (message.from.application != null) {
-            await fsAPI.write(fd, `<div class="message message-left">
-<div class="message-timestamp">${message.lastModifiedDateTime || message.createdDateTime}</div>
-<div class="message-sender">${message.from.application.displayName}</div>
-</div>`);
-          } else {
-            console.error('couldn\'t determine message sender');
-          }
+        if (message.body.contentType === 'html') {
+          await fsAPI.write(fd, `<div class="message-body">${replaceImages(message.body.content, imageIndex)}</div>
+</div>
+`);
+        } else {
+          await fsAPI.write(fd, `<div class="message-body">${escapeHtml(message.body.content || '')}</div>
+</div>
+`);
         }
+      } else if (message.from.application != null) {
+        await fsAPI.write(fd, `<div class="message message-left">
+  <div class="message-timestamp">${timestamp}</div>
+  <div class="message-sender">${escapeHtml(message.from.application.displayName || '')}</div>
+</div>
+`);
       }
     }
 
-    // write foot
     await fsAPI.write(fd, `</body>
 </html>
 `);
-
     await fsAPI.close(fd);
+    console.log(`  HTML: ${all.length} msgs total`);
   }
 }
 
-function escapeHtml (unsafe) {
-  return unsafe
+function escapeHtml(unsafe) {
+  return String(unsafe || '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -251,21 +312,13 @@ function escapeHtml (unsafe) {
     .replace(/'/g, '&#039;');
 }
 
-function replaceImages (content, imageIndex) {
-  if (imageIndex) {
-    return content.replace(UPLOADED_IMAGE_MATCH, url => {
-      // replace (if we have a replacement)
-      return imageIndex[url] || url;
-    });
-  }
-
-  return content;
+function replaceImages(content, imageIndex) {
+  if (!imageIndex) return content;
+  return content.replace(UPLOADED_IMAGE_MATCH, url => imageIndex[url] || url);
 }
 
-function pipeDone (readable) {
-  return new Promise((resolve, reject) => {
-    readable.on('end', resolve);
-  });
+function pipeDone(readable) {
+  return new Promise((resolve) => { readable.on('end', resolve); });
 }
 
 module.exports = Backup;
